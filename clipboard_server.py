@@ -5,6 +5,7 @@ import socket
 import json
 import threading
 import webbrowser
+import time
 from datetime import datetime
 
 try:
@@ -27,8 +28,14 @@ except ImportError:
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 PORT = 8080
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    max_size = app.config.get("MAX_CONTENT_LENGTH", 200 * 1024 * 1024)
+    return jsonify({"ok": False, "error": f"文件大小超过限制 ({max_size // 1024 // 1024}MB)"}), 413
 
 @app.after_request
 def add_cors_headers(response):
@@ -40,16 +47,194 @@ def add_cors_headers(response):
 @app.route("/", methods=["OPTIONS"])
 @app.route("/clipboard", methods=["OPTIONS"])
 @app.route("/upload", methods=["OPTIONS"])
+@app.route("/upload/init", methods=["OPTIONS"])
+@app.route("/upload/chunk", methods=["OPTIONS"])
+@app.route("/upload/complete", methods=["OPTIONS"])
 @app.route("/files", methods=["OPTIONS"])
 @app.route("/files/delete/<path:filename>", methods=["OPTIONS"])
 def handle_options():
     return "", 204
 
+def get_app_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(__file__)
+
 CLIPBOARD_HISTORY = []
 MAX_HISTORY = 50
-HISTORY_FILE = os.path.join(os.path.dirname(__file__), "clipboard_history.json")
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
-MAX_FILE_SIZE = 10 * 1024 * 1024
+
+UPLOAD_CHUNKS_DIR = None
+UPLOAD_DIR = None
+upload_sessions = {}
+
+def generate_upload_id():
+    import uuid
+    return str(uuid.uuid4())[:8]
+
+def cleanup_expired_sessions():
+    global upload_sessions
+    now = datetime.now().timestamp()
+    expired_ids = []
+    
+    for upload_id, session in upload_sessions.items():
+        created_at = session.get("created_at", 0)
+        if now - created_at > 3600:
+            expired_ids.append(upload_id)
+    
+    for upload_id in expired_ids:
+        session = upload_sessions[upload_id]
+        chunk_count = session.get("chunk_count", 0)
+        for i in range(chunk_count):
+            chunk_path = os.path.join(UPLOAD_CHUNKS_DIR, f"{upload_id}_{i}")
+            if os.path.exists(chunk_path):
+                try:
+                    os.remove(chunk_path)
+                except:
+                    pass
+        
+        del upload_sessions[upload_id]
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 清理过期会话: {upload_id}")
+    
+    if expired_ids:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 共清理 {len(expired_ids)} 个过期会话")
+
+def start_cleanup_thread():
+    def cleanup_loop():
+        while True:
+            cleanup_expired_sessions()
+            time.sleep(300)
+    
+    thread = threading.Thread(target=cleanup_loop, daemon=True)
+    thread.start()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 定时清理线程已启动，每5分钟清理一次")
+
+@app.route("/upload/init", methods=["POST"])
+def init_upload():
+    try:
+        data = request.get_json()
+        filename = data.get("filename", "")
+        total_size = data.get("totalSize", 0)
+        chunk_count = data.get("chunkCount", 0)
+        
+        if not filename:
+            return jsonify({"ok": False, "error": "文件名不能为空"}), 400
+        
+        if not os.path.exists(UPLOAD_CHUNKS_DIR):
+            os.makedirs(UPLOAD_CHUNKS_DIR)
+        
+        upload_id = generate_upload_id()
+        safe_name = filename.replace("\\", "_").replace("/", "_").replace(":", "_")
+        session = {
+            "upload_id": upload_id,
+            "filename": filename,
+            "safe_name": safe_name,
+            "total_size": total_size,
+            "chunk_count": chunk_count,
+            "chunks_received": [],
+            "created_at": datetime.now().timestamp()
+        }
+        upload_sessions[upload_id] = session
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 初始化上传: {filename} ({total_size} bytes) -> {upload_id}")
+        return jsonify({"ok": True, "uploadId": upload_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/upload/chunk", methods=["POST"])
+def upload_chunk():
+    try:
+        upload_id = request.form.get("uploadId", "")
+        chunk_index = int(request.form.get("chunkIndex", -1))
+        chunk_count = int(request.form.get("chunkCount", 0))
+        
+        if not upload_id or upload_id not in upload_sessions:
+            return jsonify({"ok": False, "error": "无效的上传会话"}), 400
+        
+        if "chunk" not in request.files:
+            return jsonify({"ok": False, "error": "缺少分块数据"}), 400
+        
+        session = upload_sessions[upload_id]
+        
+        if chunk_index < 0 or chunk_index >= chunk_count:
+            return jsonify({"ok": False, "error": "无效的分块索引"}), 400
+        
+        chunk_file = request.files["chunk"]
+        chunk_path = os.path.join(UPLOAD_CHUNKS_DIR, f"{upload_id}_{chunk_index}")
+        
+        chunk_file.save(chunk_path)
+        
+        if chunk_index not in session["chunks_received"]:
+            session["chunks_received"].append(chunk_index)
+        
+        session["chunks_received"].sort()
+        progress = len(session["chunks_received"]) / chunk_count * 100
+        
+        return jsonify({
+            "ok": True,
+            "uploadId": upload_id,
+            "chunkIndex": chunk_index,
+            "received": len(session["chunks_received"]),
+            "total": chunk_count,
+            "progress": round(progress, 2)
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/upload/complete", methods=["POST"])
+def complete_upload():
+    try:
+        data = request.get_json()
+        upload_id = data.get("uploadId", "")
+        
+        if not upload_id or upload_id not in upload_sessions:
+            return jsonify({"ok": False, "error": "无效的上传会话"}), 400
+        
+        session = upload_sessions[upload_id]
+        chunk_count = session["chunk_count"]
+        
+        for i in range(chunk_count):
+            if i not in session["chunks_received"]:
+                return jsonify({"ok": False, "error": f"缺少分块 {i}"}), 400
+        
+        today_dir = get_today_upload_dir()
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename, ext = os.path.splitext(session["filename"])
+        safe_filename = f"{filename}_{timestamp}{ext}"
+        final_path = os.path.join(today_dir, safe_filename)
+        
+        with open(final_path, "wb") as f:
+            for i in range(chunk_count):
+                chunk_path = os.path.join(UPLOAD_CHUNKS_DIR, f"{upload_id}_{i}")
+                with open(chunk_path, "rb") as cf:
+                    f.write(cf.read())
+                os.remove(chunk_path)
+        
+        del upload_sessions[upload_id]
+        
+        add_to_history(f"上传文件: {session['filename']} ({session['total_size']} bytes)")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 上传完成: {session['filename']} -> {final_path}")
+        
+        return jsonify({
+            "ok": True,
+            "message": "文件上传成功",
+            "filename": session["filename"],
+            "size": session["total_size"],
+            "saved_as": safe_filename,
+            "path": final_path
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+HISTORY_FILE = os.path.join(get_app_dir(), "clipboard_history.json")
+MAX_FILE_SIZE = 200 * 1024 * 1024
+
+def get_today_upload_dir():
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_dir = os.path.join(UPLOAD_DIR, today)
+    if not os.path.exists(today_dir):
+        os.makedirs(today_dir)
+    return today_dir
 
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -261,27 +446,28 @@ def upload_file():
     if file.filename == "":
         return jsonify({"ok": False, "error": "文件名不能为空"}), 400
     
-    if not os.path.exists(UPLOAD_DIR):
-        os.makedirs(UPLOAD_DIR)
+    today_dir = get_today_upload_dir()
     
-    file_size = 0
-    chunk = file.read(1024)
-    while chunk:
-        file_size += len(chunk)
-        if file_size > MAX_FILE_SIZE:
-            return jsonify({"ok": False, "error": f"文件大小超过限制 ({MAX_FILE_SIZE // 1024 // 1024}MB)"}), 400
-        chunk = file.read(1024)
-    
-    file.seek(0)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename, ext = os.path.splitext(file.filename)
     safe_filename = f"{filename}_{timestamp}{ext}"
-    filepath = os.path.join(UPLOAD_DIR, safe_filename)
+    filepath = os.path.join(today_dir, safe_filename)
     
     try:
-        file.save(filepath)
+        file_size = 0
+        with open(filepath, "wb") as f:
+            while True:
+                chunk = file.stream.read(8192)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                if file_size > MAX_FILE_SIZE:
+                    os.remove(filepath)
+                    return jsonify({"ok": False, "error": f"文件大小超过限制 ({MAX_FILE_SIZE // 1024 // 1024}MB)"}), 400
+                f.write(chunk)
+        
         add_to_history(f"上传文件: {file.filename} ({file_size} bytes)")
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 已上传文件: {file.filename} -> {filepath}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 已上传文件: {file.filename} -> {filepath} ({file_size} bytes)")
         return jsonify({
             "ok": True,
             "message": f"文件上传成功",
@@ -300,14 +486,26 @@ def list_files():
             return jsonify({"files": [], "count": 0})
         
         files = []
-        for filename in os.listdir(UPLOAD_DIR):
-            filepath = os.path.join(UPLOAD_DIR, filename)
-            if os.path.isfile(filepath):
+        for item in os.listdir(UPLOAD_DIR):
+            item_path = os.path.join(UPLOAD_DIR, item)
+            if os.path.isdir(item_path):
+                for filename in os.listdir(item_path):
+                    filepath = os.path.join(item_path, filename)
+                    if os.path.isfile(filepath):
+                        files.append({
+                            "filename": filename,
+                            "date": item,
+                            "size": os.path.getsize(filepath),
+                            "modified": datetime.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y-%m-%d %H:%M"),
+                            "download_url": f"/files/download/{item}/{filename}"
+                        })
+            elif os.path.isfile(item_path):
                 files.append({
-                    "filename": filename,
-                    "size": os.path.getsize(filepath),
-                    "modified": datetime.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y-%m-%d %H:%M"),
-                    "download_url": f"/files/download/{filename}"
+                    "filename": item,
+                    "date": "",
+                    "size": os.path.getsize(item_path),
+                    "modified": datetime.fromtimestamp(os.path.getmtime(item_path)).strftime("%Y-%m-%d %H:%M"),
+                    "download_url": f"/files/download/{item}"
                 })
         
         files.sort(key=lambda x: x["modified"], reverse=True)
@@ -322,7 +520,8 @@ def download_file(filename):
         if not os.path.exists(filepath):
             return jsonify({"ok": False, "error": "文件不存在"}), 404
         
-        return send_file(filepath, as_attachment=True, download_name=filename)
+        display_name = os.path.basename(filename)
+        return send_file(filepath, as_attachment=True, download_name=display_name)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -334,7 +533,7 @@ def delete_file(filename):
             return jsonify({"ok": False, "error": "文件不存在"}), 404
         
         os.remove(filepath)
-        add_to_history(f"删除文件: {filename}")
+        add_to_history(f"删除文件: {os.path.basename(filename)}")
         return jsonify({"ok": True, "message": "文件已删除"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -415,7 +614,7 @@ input[type="file"]{display:none}
 <div class="upload-area" id="uploadArea">
 <div class="icon">上传</div>
 <div class="text">点击选择文件</div>
-<div class="hint">支持图片、文档等，最大 10MB</div>
+<div class="hint">支持图片、文档等，最大 200MB</div>
 </div>
 <input type="file" id="fileInput">
 <div class="progress" id="uploadProgress" style="display:none"><div class="progress-bar" id="uploadBar"></div></div>
@@ -504,6 +703,20 @@ function sendText() {
     xhr.send(content);
 }
 
+function getChunkSize(fileSize) {
+    if (fileSize <= 50 * 1024 * 1024) {
+        return null;
+    } else if (fileSize <= 100 * 1024 * 1024) {
+        return 5 * 1024 * 1024;
+    } else if (fileSize <= 512 * 1024 * 1024) {
+        return 10 * 1024 * 1024;
+    } else if (fileSize <= 1024 * 1024 * 1024) {
+        return 20 * 1024 * 1024;
+    } else {
+        return 25 * 1024 * 1024;
+    }
+}
+
 function uploadFile(input) {
     var file = input.files[0];
     if (!file) return;
@@ -513,11 +726,29 @@ function uploadFile(input) {
     progress.style.display = 'block';
     bar.style.width = '0%';
     
+    var chunkSize = getChunkSize(file.size);
+    
+    if (chunkSize === null) {
+        uploadDirectly(file, progress, bar, input);
+    } else {
+        uploadWithChunks(file, chunkSize, progress, bar, input);
+    }
+}
+
+function uploadDirectly(file, progress, bar, input) {
     var formData = new FormData();
     formData.append('file', file);
     
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/upload', true);
+    xhr.timeout = 300000;
+    
+    xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+            var percent = Math.round((e.loaded / e.total) * 100);
+            bar.style.width = percent + '%';
+        }
+    };
     
     xhr.onload = function() {
         bar.style.width = '100%';
@@ -549,7 +780,168 @@ function uploadFile(input) {
         showMsg('uploadMsg', '网络错误: 无法连接服务器', 'error');
     };
     
+    xhr.ontimeout = function() {
+        progress.style.display = 'none';
+        input.value = '';
+        showMsg('uploadMsg', '上传超时: 文件过大或网络过慢', 'error');
+    };
+    
     xhr.send(formData);
+}
+
+function uploadWithChunks(file, chunkSize, progress, bar, input) {
+    var chunkCount = Math.ceil(file.size / chunkSize);
+    var uploadId = null;
+    var currentChunk = 0;
+    var receivedChunks = [];
+    
+    function initUpload() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/upload/init', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.timeout = 10000;
+        
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                try {
+                    var result = JSON.parse(xhr.responseText);
+                    if (result.ok) {
+                        uploadId = result.uploadId;
+                        uploadNextChunk();
+                    } else {
+                        showMsg('uploadMsg', '初始化失败: ' + result.error, 'error');
+                        progress.style.display = 'none';
+                        input.value = '';
+                    }
+                } catch (e) {
+                    showMsg('uploadMsg', '解析错误: ' + e.message, 'error');
+                    progress.style.display = 'none';
+                    input.value = '';
+                }
+            } else {
+                showMsg('uploadMsg', '初始化失败: HTTP ' + xhr.status, 'error');
+                progress.style.display = 'none';
+                input.value = '';
+            }
+        };
+        
+        xhr.onerror = function() {
+            showMsg('uploadMsg', '网络错误: 无法连接服务器', 'error');
+            progress.style.display = 'none';
+            input.value = '';
+        };
+        
+        xhr.send(JSON.stringify({
+            filename: file.name,
+            totalSize: file.size,
+            chunkCount: chunkCount
+        }));
+    }
+    
+    function uploadNextChunk() {
+        if (currentChunk >= chunkCount) {
+            completeUpload();
+            return;
+        }
+        
+        var start = currentChunk * chunkSize;
+        var end = Math.min(start + chunkSize, file.size);
+        var chunk = file.slice(start, end);
+        
+        var formData = new FormData();
+        formData.append('uploadId', uploadId);
+        formData.append('chunkIndex', currentChunk);
+        formData.append('chunkCount', chunkCount);
+        formData.append('chunk', chunk);
+        
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/upload/chunk', true);
+        xhr.timeout = 60000;
+        
+        xhr.onload = function() {
+            if (xhr.status === 200) {
+                try {
+                    var result = JSON.parse(xhr.responseText);
+                    if (result.ok) {
+                        receivedChunks.push(currentChunk);
+                        currentChunk++;
+                        var percent = Math.round((receivedChunks.length / chunkCount) * 100);
+                        bar.style.width = percent + '%';
+                        uploadNextChunk();
+                    } else {
+                        showMsg('uploadMsg', '上传失败: ' + result.error, 'error');
+                        progress.style.display = 'none';
+                        input.value = '';
+                    }
+                } catch (e) {
+                    showMsg('uploadMsg', '解析错误: ' + e.message, 'error');
+                    progress.style.display = 'none';
+                    input.value = '';
+                }
+            } else {
+                showMsg('uploadMsg', '上传失败: HTTP ' + xhr.status, 'error');
+                progress.style.display = 'none';
+                input.value = '';
+            }
+        };
+        
+        xhr.onerror = function() {
+            showMsg('uploadMsg', '网络错误: 分块上传失败', 'error');
+            progress.style.display = 'none';
+            input.value = '';
+        };
+        
+        xhr.ontimeout = function() {
+            showMsg('uploadMsg', '上传超时: 网络过慢', 'error');
+            progress.style.display = 'none';
+            input.value = '';
+        };
+        
+        xhr.send(formData);
+    }
+    
+    function completeUpload() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/upload/complete', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.timeout = 30000;
+        
+        xhr.onload = function() {
+            bar.style.width = '100%';
+            
+            if (xhr.status === 200) {
+                try {
+                    var result = JSON.parse(xhr.responseText);
+                    if (result.ok) {
+                        showMsg('uploadMsg', '文件上传成功', 'success');
+                        loadFiles();
+                        loadHistory();
+                    } else {
+                        showMsg('uploadMsg', '合并失败: ' + result.error, 'error');
+                    }
+                } catch (e) {
+                    showMsg('uploadMsg', '解析错误: ' + e.message, 'error');
+                }
+            } else {
+                showMsg('uploadMsg', '合并失败: HTTP ' + xhr.status, 'error');
+            }
+            
+            setTimeout(function() { progress.style.display = 'none'; }, 500);
+            input.value = '';
+        };
+        
+        xhr.onerror = function() {
+            showMsg('uploadMsg', '网络错误: 合并失败', 'error');
+            progress.style.display = 'none';
+            input.value = '';
+        };
+        
+        xhr.send(JSON.stringify({
+            uploadId: uploadId
+        }));
+    }
+    
+    initUpload();
 }
 
 function formatSize(bytes) {
@@ -732,10 +1124,37 @@ def check_dependencies():
         return False
     return True
 
-def start_server(port=8080):
-    global PORT
+def start_server(port=8080, max_size_mb=200, upload_dir=None):
+    global PORT, MAX_FILE_SIZE, UPLOAD_DIR, UPLOAD_CHUNKS_DIR
     PORT = port
+    MAX_FILE_SIZE = max_size_mb * 1024 * 1024
+    app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
+    
+    if upload_dir:
+        UPLOAD_DIR = os.path.abspath(upload_dir)
+    else:
+        UPLOAD_DIR = os.path.join(get_app_dir(), "uploads")
+    
+    UPLOAD_CHUNKS_DIR = os.path.join(os.path.dirname(UPLOAD_DIR), "upload_chunks")
+    
     load_history()
+    
+    if not os.path.exists(UPLOAD_DIR):
+        try:
+            os.makedirs(UPLOAD_DIR)
+            print(f"[INFO] 创建上传目录: {UPLOAD_DIR}")
+        except Exception as e:
+            print(f"[ERROR] 创建上传目录失败: {e}")
+    
+    if not os.path.exists(UPLOAD_CHUNKS_DIR):
+        try:
+            os.makedirs(UPLOAD_CHUNKS_DIR)
+            print(f"[INFO] 创建分块目录: {UPLOAD_CHUNKS_DIR}")
+        except Exception as e:
+            print(f"[ERROR] 创建分块目录失败: {e}")
+    
+    start_cleanup_thread()
+    
     local_ip = get_local_ip()
     all_ips = get_all_local_ips()
     service_url = f"http://{local_ip}:{PORT}"
@@ -745,6 +1164,9 @@ def start_server(port=8080):
     print("=" * 50)
     print(f"主服务地址: {service_url}")
     print(f"主 IP: {local_ip}")
+    print(f"应用目录: {get_app_dir()}")
+    print(f"上传目录: {UPLOAD_DIR}")
+    print(f"最大文件大小: {max_size_mb}MB")
     if len(all_ips) > 1:
         print("\n其他可用 IP 地址:")
         for ip in all_ips:
@@ -757,29 +1179,44 @@ def start_server(port=8080):
     
     threading.Timer(1, lambda: webbrowser.open(service_url)).start()
     
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    try:
+        from waitress import serve
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 使用 Waitress 服务器")
+        serve(app, host="0.0.0.0", port=PORT)
+    except ImportError:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 使用 Flask 开发服务器（建议安装 waitress）")
+        app.run(host="0.0.0.0", port=PORT, debug=False)
 
 def print_usage():
     print("用法:")
     print("  python clipboard_server.py")
     print("  python clipboard_server.py -p <端口号>")
     print("  python clipboard_server.py --port <端口号>")
-    print("  python clipboard_server.py <端口号>")
+    print("  python clipboard_server.py -maxSize <最大文件大小(MB)>")
+    print("  python clipboard_server.py --maxSize <最大文件大小(MB)>")
+    print("  python clipboard_server.py -uploadDir <上传目录>")
+    print("  python clipboard_server.py --uploadDir <上传目录>")
     print("")
     print("示例:")
     print("  python clipboard_server.py -p 8081")
     print("  python clipboard_server.py --port 9090")
-    print("  python clipboard_server.py 8080")
+    print("  python clipboard_server.py -maxSize 500")
+    print("  python clipboard_server.py -uploadDir D:\\uploads")
+    print("  python clipboard_server.py -p 8081 -maxSize 500 -uploadDir D:\\uploads")
     print("")
     print("默认端口: 8080")
+    print("默认最大文件大小: 200MB")
+    print("默认上传目录: exe所在目录/uploads")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description='iPhone 剪贴板同步服务')
     parser.add_argument('-p', '--port', type=int, default=8080, help='服务端口号')
+    parser.add_argument('-maxSize', '--maxSize', type=int, default=200, help='最大文件大小(MB)')
+    parser.add_argument('-uploadDir', '--uploadDir', type=str, default=None, help='上传文件保存目录')
     args = parser.parse_args()
     
     if not check_dependencies():
         sys.exit(1)
     
-    start_server(args.port)
+    start_server(args.port, args.maxSize, args.uploadDir)
