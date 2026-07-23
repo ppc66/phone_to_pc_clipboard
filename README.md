@@ -1,5 +1,19 @@
-<img width="660" height="1434" alt="IMG_3530_20260719_212807" src="https://github.com/user-attachments/assets/35482e79-bb03-43d9-8471-cd6e1b163a20" /># phone_to_pc_clipboard
+
 手机粘贴同步至电脑（支持文件上传）
+支持定时清除历史会话
+端口、上传文件路径、上传文件大小可指定
+python clipboard_server.py -h
+usage: clipboard_server.py [-h] [-p PORT] [-maxSize MAXSIZE] [-uploadDir UPLOADDIR]
+iPhone 剪贴板同步服务
+
+options:
+  -h, --help            show this help message and exit
+  -p PORT, --port PORT  服务端口号
+  -maxSize MAXSIZE, --maxSize MAXSIZE
+                        最大文件大小(MB)
+  -uploadDir UPLOADDIR, --uploadDir UPLOADDIR
+                        上传文件保存目录
+
 
 <img width="220" height="100%" alt="IMG_3530_20260719_212807" src="https://github.com/user-attachments/assets/6517adcc-a73b-4f67-aa63-b9198a919722" />
 
@@ -9,4 +23,4 @@
 手机端将内容粘贴到文本框中点击发送到电脑，自动出现在电脑的剪贴板（要求在同一局域网）
 
 
-An AI-powered clipboard application built on Trae. 
+An AI-powered clipboard tool built on Trae. 
